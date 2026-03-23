@@ -7,6 +7,7 @@ import { pool, initDb } from "./db.js"
 import authRoutes from "./routes/auth.js"
 import { startPriceMonitor } from "./jobs/priceMonitor.js"
 import userDataRoutes from "./routes/userData.js"
+import furniDataRoutes, { warmupFurniCache } from "./routes/furnidata.js"
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -38,6 +39,7 @@ const authLimiter = rateLimit({
 // ── Rotas ──────────────────────────────────────────────────────────────────
 app.use("/api/auth", authLimiter, authRoutes)
 app.use("/api/user", userDataRoutes)
+app.use("/api/furnidata", furniDataRoutes)
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: Date.now() })
@@ -56,6 +58,7 @@ app.use((err, req, res, _next) => {
 // ── Inicialização ──────────────────────────────────────────────────────────
 async function start() {
   await initDb()
+  await warmupFurniCache()
   startPriceMonitor()
   app.listen(PORT, () => {
     console.log(`✅ Habbip API rodando na porta ${PORT}`)
