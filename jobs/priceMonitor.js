@@ -1,137 +1,300 @@
-import {
-  fetchCurrentPrice,
-} from "../services/habboApi.js"
-import { pool } from "../db.js"
+// jobs/priceMonitor.js — Worker sem prioridade, todos os itens no mesmo intervalo
 
-const POLL_INTERVAL_MS = 30 * 60 * 1000  // 30 minutos
-const BATCH_SIZE = 5                       // usuários por lote
-const ITEM_DELAY_MS = 800                  // pausa entre itens
-const USER_DELAY_MS = 200                  // pausa entre usuários
-const MAX_NOTIFICATIONS = 50
+import crypto from "node:crypto";
+import { fetchOfficialMarketBatchSafe } from "../services/habboApi.js";
+import { pool } from "../db.js";
+import { redisPublisher } from "../services/redis.js";
 
-// ── Processa um único usuário ────────────────────────────────────────────────
-async function processUser(userId, watchlist) {
-  if (!Array.isArray(watchlist) || watchlist.length === 0) return 0
+const ITEM_DELAY_MS = 300;
+const MAX_NOTIFICATIONS = 50;
+const MONITOR_INTERVAL_MS = 30 * 1000; // todos os itens são checados a cada 30s
 
-  const newNotifications = []
-  const updatedWatchlist = [...watchlist]
+// Busca itens que precisam ser verificados agora, agrupados por hotel
+async function fetchItemsDue() {
+  const cutoff = new Date(Date.now() - MONITOR_INTERVAL_MS);
 
-  for (let i = 0; i < watchlist.length; i++) {
-    const item = watchlist[i]
-    if (!item?.ClassName) continue
+  const { rows } = await pool.query(
+    `SELECT id, classname, hotel, furni_name, furni_type,
+            last_known_price, subscriber_count
+     FROM monitored_items
+     WHERE subscriber_count > 0
+       AND (last_checked_at IS NULL OR last_checked_at < $1)
+     ORDER BY last_checked_at ASC NULLS FIRST
+     LIMIT 300`,
+    [cutoff],
+  );
+
+  return rows;
+}
+
+// Agrupa itens por hotel para fazer batch por hotel
+function groupByHotel(items) {
+  const map = new Map();
+
+  for (const item of items) {
+    const hotel = item.hotel || "br";
+    if (!map.has(hotel)) map.set(hotel, []);
+    map.get(hotel).push(item);
+  }
+
+  return map;
+}
+
+async function processHotelBatch(hotel, items) {
+  const batchItems = items.map((i) => ({
+    classname: i.classname,
+    furniType: i.furni_type === "wallItem" ? "wallItem" : "roomItem",
+  }));
+
+  let officialBatch;
+
+  try {
+    officialBatch = await fetchOfficialMarketBatchSafe(batchItems, hotel);
+  } catch (err) {
+    console.error(`[Monitor] Erro ao buscar batch hotel=${hotel}:`, err.message);
+    return;
+  }
+
+  const officialMap = new Map();
+
+  for (const entry of officialBatch.roomItemData ?? []) {
+    if (entry.item) officialMap.set(entry.item.toLowerCase(), entry);
+  }
+
+  for (const entry of officialBatch.wallItemData ?? []) {
+    if (entry.item) officialMap.set(entry.item.toLowerCase(), entry);
+  }
+
+  for (const item of items) {
+    const official = officialMap.get(item.classname.toLowerCase());
+
+    const currentPrice =
+      official?.currentPrice != null ? Number(official.currentPrice) : null;
+
+    const averagePrice =
+      official?.averagePrice != null ? Number(official.averagePrice) : null;
+
+    const newPrice = currentPrice;
+
+    // Atualiza last_checked_at sempre
+    await pool.query(
+      `UPDATE monitored_items
+       SET last_checked_at = NOW(),
+           last_known_price = COALESCE($1, last_known_price),
+           subscriber_count = (
+             SELECT COUNT(*)
+             FROM user_subscriptions
+             WHERE classname = $2
+               AND hotel = $3
+               AND active = TRUE
+           )
+       WHERE classname = $2
+         AND hotel = $3`,
+      [newPrice, item.classname, hotel],
+    );
+
+    if (newPrice == null) continue;
+
+    // Salva em market_prices (upsert)
+    const marketData = official
+      ? {
+        currentPrice: official.currentPrice,
+        averagePrice: official.averagePrice,
+        currentOpenOffers: official.currentOpenOffers,
+        totalOpenOffers: official.totalOpenOffers,
+        soldItemCount: official.soldItemCount,
+        history: official.history ?? [],
+      }
+      : null;
+
+    await pool.query(
+      `INSERT INTO market_prices (
+         classname,
+         hotel,
+         current_price,
+         average_price,
+         open_offers,
+         market_data,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (classname, hotel) DO UPDATE
+       SET current_price = $3,
+           average_price = $4,
+           open_offers = $5,
+           market_data = $6,
+           updated_at = NOW()`,
+      [
+        item.classname,
+        hotel,
+        currentPrice,
+        averagePrice,
+        official?.currentOpenOffers ?? null,
+        JSON.stringify(marketData),
+      ],
+    );
+
+    const oldPrice = item.last_known_price;
+
+    console.log("[Monitor][debug]", {
+      classname: item.classname,
+      hotel,
+      oldPrice,
+      currentPrice,
+      averagePrice,
+      newPrice,
+    });
+
+    if (!oldPrice || oldPrice === newPrice) continue;
+
+    // Salva no histórico
+    await pool.query(
+      `INSERT INTO price_history (classname, hotel, price)
+       VALUES ($1, $2, $3)`,
+      [item.classname, hotel, newPrice],
+    );
+
+    const diff = newPrice - oldPrice;
+    const pct = parseFloat(((diff / oldPrice) * 100).toFixed(1));
+
+    const detectedAt = Date.now();
+    const eventId = crypto.randomUUID();
+
+    // Publica no Redis — a API vai distribuir para os SSE dos usuários inscritos
+    const event = {
+      id: eventId,
+      type: "price_changed",
+      className: item.classname,
+      classname: item.classname,
+      furniName: item.furni_name,
+      hotel,
+      oldPrice,
+      newPrice,
+      diff,
+      pct,
+      direction: diff > 0 ? "up" : "down",
+      detectedAt,
+      timestamp: detectedAt,
+    };
 
     try {
-      const newPrice = await fetchCurrentPrice(item.ClassName, item.hotel ?? "br")
-      if (newPrice == null || newPrice === 0) continue
+      const publishAt = Date.now();
+      event.publishAt = publishAt;
 
-      const oldPrice = item.basePrice
+      console.log(
+        `[Monitor] ${event.className}/${hotel} detectado -> publish: ${publishAt - detectedAt}ms`,
+      );
 
-      // Atualiza basePrice sempre, mesmo sem variação
-      updatedWatchlist[i] = { ...item, basePrice: newPrice }
-
-      if (!oldPrice || oldPrice === newPrice) continue
-
-      const diff = newPrice - oldPrice
-      const pct = parseFloat(((diff / oldPrice) * 100).toFixed(1))
-
-      newNotifications.push({
-        id: `${item.ClassName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        className: item.ClassName,
-        furniName: item.FurniName,
-        oldPrice,
-        newPrice,
-        diff,
-        pct,
-        direction: diff > 0 ? "up" : "down",
-        hotel: item.hotel ?? "br",
-        read: false,
-        createdAt: Date.now(),
-        source: "background",
-      })
-    } catch {
-      // Silencia erros individuais
+      await redisPublisher.publish(
+        "habbip:price_events",
+        JSON.stringify(event),
+      );
+    } catch (err) {
+      console.error("[Monitor] Erro ao publicar no Redis:", err.message);
     }
 
-    if (i < watchlist.length - 1) {
-      await new Promise((r) => setTimeout(r, ITEM_DELAY_MS))
-    }
-  }
+    // Cria notificações no banco para os inscritos (fallback se SSE cair)
+    await createNotificationsForSubscribers(item.classname, hotel, event);
 
-  // Só salva se teve mudança
-  const watchlistChanged = updatedWatchlist.some((u, i) => u !== watchlist[i])
-  if (newNotifications.length === 0 && !watchlistChanged) return 0
-
-  const client = await pool.connect()
-  try {
-    await client.query("BEGIN")
-
-    const { rows } = await client.query(
-      "SELECT notifications FROM user_data WHERE user_id = $1 FOR UPDATE",
-      [userId]
-    )
-    const existing = Array.isArray(rows[0]?.notifications) ? rows[0].notifications : []
-    const mergedNotifs = [...newNotifications, ...existing].slice(0, MAX_NOTIFICATIONS)
-
-    await client.query(
-      `UPDATE user_data
-       SET watchlist = $1, notifications = $2, updated_at = NOW()
-       WHERE user_id = $3`,
-      [JSON.stringify(updatedWatchlist), JSON.stringify(mergedNotifs), userId]
-    )
-
-    await client.query("COMMIT")
-    return newNotifications.length
-  } catch (err) {
-    await client.query("ROLLBACK")
-    console.error(`[Monitor] Erro ao salvar para usuário ${userId}:`, err.message)
-    return 0
-  } finally {
-    client.release()
+    await new Promise((r) => setTimeout(r, ITEM_DELAY_MS));
   }
 }
 
-// ── Job principal ────────────────────────────────────────────────────────────
+async function createNotificationsForSubscribers(classname, hotel, event) {
+  const { rows: subs } = await pool.query(
+    `SELECT user_id, alert_config
+     FROM user_subscriptions
+     WHERE classname = $1
+       AND hotel = $2
+       AND active = TRUE`,
+    [classname, hotel],
+  );
+
+  for (const sub of subs) {
+    const cfg = sub.alert_config || { alertMode: "any" };
+    let shouldNotify = false;
+
+    if (cfg.alertMode === "any") {
+      shouldNotify = true;
+    } else if (cfg.alertMode === "price" && cfg.targetPrice != null) {
+      const margin = cfg.priceMargin ?? 0;
+      shouldNotify =
+        event.newPrice >= cfg.targetPrice - margin &&
+        event.newPrice <= cfg.targetPrice + margin;
+    }
+
+    if (!shouldNotify) continue;
+
+    const notif = {
+      id: `${classname}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      className: classname,
+      classname,
+      furniName: event.furniName,
+      oldPrice: event.oldPrice,
+      newPrice: event.newPrice,
+      diff: event.diff,
+      pct: event.pct,
+      direction: event.direction,
+      hotel,
+      read: false,
+      createdAt: Date.now(),
+      source: "background",
+      detectedAt: event.detectedAt ?? null,
+      publishAt: event.publishAt ?? null,
+    };
+
+    await prependNotification(sub.user_id, notif);
+  }
+}
+
+async function prependNotification(userId, notif) {
+  const { rows } = await pool.query(
+    `SELECT notifications
+     FROM user_data
+     WHERE user_id = $1`,
+    [userId],
+  );
+
+  const current = Array.isArray(rows[0]?.notifications)
+    ? rows[0].notifications
+    : [];
+
+  const next = [notif, ...current].slice(0, MAX_NOTIFICATIONS);
+
+  await pool.query(
+    `UPDATE user_data
+     SET notifications = $1::jsonb
+     WHERE user_id = $2`,
+    [JSON.stringify(next), userId],
+  );
+}
+
 async function runPriceMonitor() {
-  console.log("[Monitor] Iniciando verificação de preços...")
-  const startedAt = Date.now()
-  let totalUsers = 0
-  let totalNotifs = 0
-  let offset = 0
+  console.log("[Monitor] Ciclo iniciado...");
 
-  try {
-    while (true) {
-      const { rows } = await pool.query(
-        `SELECT user_id, watchlist
-         FROM user_data
-         WHERE jsonb_array_length(watchlist) > 0
-         ORDER BY updated_at ASC
-         LIMIT $1 OFFSET $2`,
-        [BATCH_SIZE, offset]
-      )
+  const items = await fetchItemsDue();
 
-      if (rows.length === 0) break
-
-      for (const row of rows) {
-        const count = await processUser(row.user_id, row.watchlist)
-        totalNotifs += count
-        totalUsers++
-        await new Promise((r) => setTimeout(r, USER_DELAY_MS))
-      }
-
-      offset += rows.length
-      if (rows.length < BATCH_SIZE) break
-    }
-  } catch (err) {
-    console.error("[Monitor] Erro no job:", err.message)
+  if (items.length === 0) {
+    console.log("[Monitor] Nenhum item elegível neste ciclo");
+    return;
   }
 
-  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
-  console.log(`[Monitor] Concluído em ${elapsed}s — ${totalUsers} usuário(s), ${totalNotifs} notificação(ões)`)
+  console.log(`[Monitor] ${items.length} itens a verificar`);
+
+  const byHotel = groupByHotel(items);
+
+  for (const [hotel, hotelItems] of byHotel) {
+    await processHotelBatch(hotel, hotelItems);
+  }
+
+  console.log("[Monitor] Ciclo concluído");
 }
 
-// ── Exporta a função de inicialização ────────────────────────────────────────
 export function startPriceMonitor() {
-  console.log(`[Monitor] Iniciado — verificações a cada ${POLL_INTERVAL_MS / 60000} minutos`)
-  runPriceMonitor() // roda imediatamente
-  setInterval(runPriceMonitor, POLL_INTERVAL_MS)
+  console.log(
+    `[Monitor] Iniciado — ciclos a cada ${MONITOR_INTERVAL_MS / 1000}s, sem prioridade`,
+  );
+
+  runPriceMonitor();
+  setInterval(runPriceMonitor, 15 * 1000);
 }

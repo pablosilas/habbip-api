@@ -32,22 +32,22 @@ export function verifyRefreshToken(token) {
  * Extrai o token do header Authorization: Bearer <token>
  */
 export function requireAuth(req, res, next) {
+  // Suporte a token via query param (necessário para EventSource/SSE)
+  const queryToken = req.query?.token
   const header = req.headers.authorization
-  if (!header?.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Autenticação necessária." })
-  }
 
-  const token = header.slice(7)
+  const token = queryToken ?? (header?.startsWith('Bearer ') ? header.slice(7) : null)
+  if (!token) return res.status(401).json({ error: 'Autenticação necessária.' })
+
   try {
     const payload = verifyAccessToken(token)
     req.userId = payload.userId
     req.habboNick = payload.habboNick
     next()
   } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Token expirado.", code: "TOKEN_EXPIRED" })
-    }
-    return res.status(401).json({ error: "Token inválido." })
+    if (err.name === 'TokenExpiredError')
+      return res.status(401).json({ error: 'Token expirado.', code: 'TOKEN_EXPIRED' })
+    return res.status(401).json({ error: 'Token inválido.' })
   }
 }
 

@@ -1,59 +1,85 @@
-/**
- * Funções para buscar dados da API do Habbo no backend.
- * Espelham a lógica do frontend (habboApi.js) mas rodam no servidor.
- */
+// services/habboApi.js  — Só API oficial do Habbo (sem habboapi.site)
 
-const HABBO_MARKET_API_BASE = "https://habboapi.site"
+const BATCH_SIZE = 25 // limite da API oficial
 
-function getHotelBaseUrl(hotel = "br") {
+function getHotelBaseUrl(hotel = 'br') {
   const map = {
-    br: "https://www.habbo.com.br",
-    com: "https://www.habbo.com",
-    de: "https://www.habbo.de",
-    es: "https://www.habbo.es",
-    fi: "https://www.habbo.fi",
-    fr: "https://www.habbo.fr",
-    it: "https://www.habbo.it",
-    nl: "https://www.habbo.nl",
-    tr: "https://www.habbo.com.tr",
+    br: 'https://www.habbo.com.br',
+    com: 'https://www.habbo.com',
+    de: 'https://www.habbo.de',
+    es: 'https://www.habbo.es',
+    fi: 'https://www.habbo.fi',
+    fr: 'https://www.habbo.fr',
+    it: 'https://www.habbo.it',
+    nl: 'https://www.habbo.nl',
+    tr: 'https://www.habbo.com.tr',
   }
-  return map[String(hotel).toLowerCase()] || "https://www.habbo.com.br"
+  return map[String(hotel).toLowerCase()] || 'https://www.habbo.com.br'
 }
 
-export async function fetchMarketHistory({ classname, hotel = "br", days = "7" }) {
-  const params = new URLSearchParams()
-  if (classname?.trim()) params.set("classname", classname.trim())
-  params.set("hotel", hotel)
-  params.set("days", days)
+function chunk(arr, size) {
+  const chunks = []
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size))
+  return chunks
+}
 
-  const res = await fetch(`${HABBO_MARKET_API_BASE}/api/market/history?${params}`)
-  if (!res.ok) throw new Error(`Erro ao buscar histórico: ${res.status}`)
+async function fetchBatchRaw(roomItems, wallItems, hotel) {
+  const base = getHotelBaseUrl(hotel)
+  const res = await fetch(`${base}/api/public/marketplace/stats/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomItems, wallItems }),
+  })
+  if (!res.ok) throw new Error(`Habbo API ${res.status}`)
   return res.json()
 }
 
-export async function fetchOfficialMarketBatch(items, hotel = "br") {
+// Busca um lote de até 25 itens (respeitando o limite oficial)
+export async function fetchOfficialMarketBatch(items, hotel = 'br') {
   const roomItems = []
   const wallItems = []
-
   for (const { classname, furniType } of items) {
     if (!classname?.trim()) continue
     const entry = { item: classname.trim() }
-    if (furniType === "wallItem") wallItems.push(entry)
+    if (furniType === 'wallItem') wallItems.push(entry)
     else roomItems.push(entry)
   }
+  return fetchBatchRaw(roomItems, wallItems, hotel)
+}
 
-  const res = await fetch(`${getHotelBaseUrl(hotel)}/api/public/marketplace/stats/batch`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ roomItems, wallItems }),
-  })
-  if (!res.ok) throw new Error(`Erro ao buscar batch oficial: ${res.status}`)
-  return res.json()
+// Busca N itens quebrando automaticamente em lotes de 25
+export async function fetchOfficialMarketBatchSafe(items, hotel = 'br') {
+  const roomItems = items.filter(i => i.furniType !== 'wallItem')
+  const wallItems = items.filter(i => i.furniType === 'wallItem')
+  const roomChunks = chunk(roomItems, BATCH_SIZE)
+  const wallChunks = chunk(wallItems, BATCH_SIZE)
+  const total = Math.max(roomChunks.length, wallChunks.length, 1)
+
+  const results = await Promise.all(
+    Array.from({ length: total }, (_, i) =>
+      fetchBatchRaw(
+        (roomChunks[i] ?? []).map(x => ({ item: x.classname })),
+        (wallChunks[i] ?? []).map(x => ({ item: x.classname })),
+        hotel
+      ).catch(() => null)
+    )
+  )
+
+  return results.reduce(
+    (acc, batch) => {
+      if (!batch) return acc
+      return {
+        roomItemData: [...acc.roomItemData, ...(batch.roomItemData ?? [])],
+        wallItemData: [...acc.wallItemData, ...(batch.wallItemData ?? [])],
+      }
+    },
+    { roomItemData: [], wallItemData: [] }
+  )
 }
 
 function normalizeOfficialItem(officialItem, statsDate) {
   const history = (officialItem.history ?? [])
-    .map((entry) => {
+    .map(entry => {
       const dayOffset = Number(entry.dayOffset ?? 0)
       const price = Number(entry.averagePrice ?? 0)
       const sold = Number(entry.totalSoldItems ?? 0)
@@ -86,60 +112,67 @@ export function mergeOfficialMarketData(legacyItems, officialBatch) {
   const officialMap = new Map()
   const statsDate =
     officialBatch.roomItemData?.[0]?.statsDate ??
-    officialBatch.wallItemData?.[0]?.statsDate ?? null
+    officialBatch.wallItemData?.[0]?.statsDate ??
+    null
 
   for (const entry of officialBatch.roomItemData ?? []) {
-    if (entry.item) officialMap.set(entry.item.toLowerCase(), { data: entry, statsDate: entry.statsDate ?? statsDate })
+    if (entry.item)
+      officialMap.set(entry.item.toLowerCase(), {
+        data: entry,
+        statsDate: entry.statsDate ?? statsDate,
+      })
   }
   for (const entry of officialBatch.wallItemData ?? []) {
-    if (entry.item) officialMap.set(entry.item.toLowerCase(), { data: entry, statsDate: entry.statsDate ?? statsDate })
+    if (entry.item)
+      officialMap.set(entry.item.toLowerCase(), {
+        data: entry,
+        statsDate: entry.statsDate ?? statsDate,
+      })
   }
 
-  return legacyItems.map((item) => {
+  return legacyItems.map(item => {
     const key = item.ClassName?.toLowerCase()
     const official = key ? officialMap.get(key) : null
     if (!official) return item
-    return { ...item, marketData: normalizeOfficialItem(official.data, official.statsDate) }
+    return {
+      ...item,
+      marketData: normalizeOfficialItem(official.data, official.statsDate),
+    }
   })
 }
 
-/**
- * Busca o preço atual de um item pelo classname.
- * Retorna o número do preço ou null se não encontrar.
- */
-export async function fetchCurrentPrice(className, hotel = "br") {
-  const legacyData = await fetchMarketHistory({ classname: className, hotel, days: "7" })
-
-  const legacyItems = (Array.isArray(legacyData) ? legacyData : []).filter(
-    (i) => !!i?.ClassName?.trim()
-  )
-  if (legacyItems.length === 0) return null
-
-  const batchItems = legacyItems.map((i) => ({
-    classname: i.ClassName,
-    furniType: i.FurniType === "wallItem" ? "wallItem" : "roomItem",
-  }))
-
-  let officialBatch = null
+// Busca o preço atual de um classname único
+export async function fetchCurrentPrice(className, hotel = 'br') {
   try {
-    officialBatch = await fetchOfficialMarketBatch(batchItems, hotel)
-  } catch { }
+    const batch = await fetchOfficialMarketBatch(
+      [{ classname: className, furniType: 'roomItem' }],
+      hotel
+    )
+    const found =
+      batch.roomItemData?.find(
+        i => i.item?.toLowerCase() === className.toLowerCase()
+      ) ??
+      batch.wallItemData?.find(
+        i => i.item?.toLowerCase() === className.toLowerCase()
+      )
 
-  const merged = officialBatch
-    ? mergeOfficialMarketData(legacyItems, officialBatch)
-    : legacyItems
+    if (!found) {
+      // Tenta wallItem se roomItem não retornou
+      const wallBatch = await fetchOfficialMarketBatch(
+        [{ classname: className, furniType: 'wallItem' }],
+        hotel
+      )
+      const wallFound = wallBatch.wallItemData?.find(
+        i => i.item?.toLowerCase() === className.toLowerCase()
+      )
+      if (!wallFound) return null
+      const norm = normalizeOfficialItem(wallFound, wallBatch.wallItemData?.[0]?.statsDate)
+      return norm.currentPrice || norm.averagePrice || null
+    }
 
-  const found = merged.find(
-    (i) => i.ClassName?.toLowerCase() === className.toLowerCase()
-  )
-  if (!found) return null
-
-  return (
-    found?.marketData?.currentPrice ??
-    (found?.marketData?.history?.length > 0
-      ? found.marketData.history[found.marketData.history.length - 1]?.[0]
-      : null) ??
-    found?.marketData?.averagePrice ??
-    null
-  )
+    const norm = normalizeOfficialItem(found, batch.roomItemData?.[0]?.statsDate)
+    return norm.currentPrice || norm.averagePrice || null
+  } catch {
+    return null
+  }
 }

@@ -8,6 +8,9 @@ import authRoutes from "./routes/auth.js"
 import { startPriceMonitor } from "./jobs/priceMonitor.js"
 import userDataRoutes from "./routes/userData.js"
 import furniDataRoutes, { warmupFurniCache } from "./routes/furnidata.js"
+import streamRoutes, { initSSESubscriber } from "./routes/stream.js"
+import subscriptionRoutes from "./routes/subscriptions.js"
+import { connectRedis } from "./services/redis.js"
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -56,6 +59,9 @@ const userDataLimiter = rateLimit({
 app.use("/api/auth", authLimiter, authRoutes)
 app.use("/api/user", userDataLimiter, userDataRoutes)
 app.use("/api/furnidata", furniDataRoutes)
+
+app.use('/api/stream', streamRoutes)
+app.use('/api/subscriptions', subscriptionRoutes)
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: Date.now() })
@@ -111,7 +117,7 @@ function startTokenCleanup() {
 // ── Graceful Shutdown ─────────────────────────────────────────────────────
 function gracefulShutdown(signal) {
   console.log(`\n${signal} recebido, desligando gracefully...`)
-  
+
   // Limpar intervalos
   if (priceMonitorInterval) {
     clearInterval(priceMonitorInterval)
@@ -119,7 +125,7 @@ function gracefulShutdown(signal) {
   if (tokenCleanupInterval) {
     clearInterval(tokenCleanupInterval)
   }
-  
+
   // Encerrar pool de conexões
   pool.end()
     .then(() => {
@@ -139,6 +145,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 async function start() {
   await initDb()
   await warmupFurniCache()
+  await connectRedis()        // ← novo
+  await initSSESubscriber()   // ← novo
   startPriceMonitor()
   startTokenCleanup()
   app.listen(PORT, () => {
