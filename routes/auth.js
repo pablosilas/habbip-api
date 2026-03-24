@@ -186,19 +186,24 @@ router.post("/refresh", async (req, res) => {
 
 // ── POST /api/auth/logout ──────────────────────────────────────────────────
 router.post("/logout", requireAuth, async (req, res) => {
-  const { refreshToken } = req.body ?? {}
-  if (refreshToken) {
-    await pool.query(
-      "DELETE FROM refresh_tokens WHERE token_hash = $1",
-      [hashToken(refreshToken)]
-    )
-  } else {
-    await pool.query(
-      "DELETE FROM refresh_tokens WHERE user_id = $1",
-      [req.userId]
-    )
+  try {
+    const { refreshToken } = req.body ?? {}
+    if (refreshToken) {
+      await pool.query(
+        "DELETE FROM refresh_tokens WHERE token_hash = $1",
+        [hashToken(refreshToken)]
+      )
+    } else {
+      await pool.query(
+        "DELETE FROM refresh_tokens WHERE user_id = $1",
+        [req.userId]
+      )
+    }
+    res.json({ ok: true })
+  } catch (err) {
+    console.error("[Logout] Erro:", err.message)
+    res.status(500).json({ error: "Erro ao fazer logout." })
   }
-  res.json({ ok: true })
 })
 
 // ── PATCH /api/auth/me ─────────────────────────────────────────────────────

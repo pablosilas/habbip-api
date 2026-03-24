@@ -17,10 +17,27 @@ const hotelMap = {
 
 let furniCache = {}
 const CACHE_TTL_MS = 60 * 60 * 1000 // 1 hora
+const MAX_CACHE_HOTELS = 10 // Limite máximo de hotéis em cache
+const DEFAULT_FETCH_TIMEOUT_MS = 5000
+
+/**
+ * Faz fetch com timeout para evitar travamentos
+ */
+function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+  return Promise.race([
+    fetch(url, options),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Timeout após ${timeoutMs}ms`)),
+        timeoutMs
+      )
+    ),
+  ])
+}
 
 export async function warmupFurniCache() {
   try {
-    const res = await fetch("https://www.habbo.com.br/gamedata/furnidata_json/1")
+    const res = await fetchWithTimeout("https://www.habbo.com.br/gamedata/furnidata_json/1")
     if (!res.ok) return
     const data = await res.json()
     furniCache["br"] = { data, fetchedAt: Date.now() }
@@ -39,9 +56,17 @@ router.get("/", async (req, res) => {
   }
 
   try {
-    const response = await fetch(`${baseUrl}/gamedata/furnidata_json/1`)
+    const response = await fetchWithTimeout(`${baseUrl}/gamedata/furnidata_json/1`)
     if (!response.ok) throw new Error(`Habbo retornou ${response.status}`)
     const data = await response.json()
+
+    // Implementar limite de tamanho: remover hotel mais antigo se necessário
+    if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
+      const oldestHotel = Object.entries(furniCache)
+        .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
+      delete furniCache[oldestHotel]
+    }
+
     furniCache[hotel] = { data, fetchedAt: Date.now() }
     console.log(`[furnidata] buscado do Habbo: ${hotel}`)
     res.json(data)
@@ -59,9 +84,17 @@ router.get("/search", async (req, res) => {
   let data = furniCache[hotel]?.data
   if (!data) {
     try {
-      const response = await fetch(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
+      const response = await fetchWithTimeout(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
       if (!response.ok) throw new Error()
       data = await response.json()
+
+      // Implementar limite de tamanho
+      if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
+        const oldestHotel = Object.entries(furniCache)
+          .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
+        delete furniCache[oldestHotel]
+      }
+
       furniCache[hotel] = { data, fetchedAt: Date.now() }
     } catch {
       return res.status(502).json({ error: "Falha ao buscar furnidata." })
@@ -83,23 +116,59 @@ router.get("/search", async (req, res) => {
 
 const imageUrlCache = new Map() // classname:hotel → url
 
+function getCacheValue(map, key) {
+  if (!map.has(key)) return undefined
+
+  const value = map.get(key)
+  map.delete(key)
+  map.set(key, value)
+
+  return value
+}
+
+function setCacheValue(map, key, value, maxSize = 500) {
+  if (map.has(key)) {
+    map.delete(key)
+  } else if (map.size >= maxSize) {
+    const oldestKey = map.keys().next().value
+    map.delete(oldestKey)
+  }
+
+  map.set(key, value)
+}
+
 router.get("/image-url", async (req, res) => {
   const { classname, hotel = "br" } = req.query
   if (!classname) return res.status(400).json({ error: "classname obrigatório." })
 
+  // Validar classname para evitar XSS em logs
+  if (!classname.match(/^[a-z0-9\-_*]+$/i)) {
+    return res.status(400).json({ error: "classname inválido." })
+  }
+
   const base = classname.replace("*", "_")   // para URL
   const cacheKey = `${base}:${hotel}`
 
-  if (imageUrlCache.has(cacheKey)) {
-    return res.json({ url: imageUrlCache.get(cacheKey) })
+  const cached = getCacheValue(imageUrlCache, cacheKey)
+
+  if (cached !== undefined) {
+    return res.json({ url: cached })
   }
 
   let data = furniCache[hotel]?.data
   if (!data) {
     try {
-      const response = await fetch(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
+      const response = await fetchWithTimeout(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
       if (!response.ok) throw new Error()
       data = await response.json()
+
+      // Implementar limite de tamanho
+      if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
+        const oldestHotel = Object.entries(furniCache)
+          .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
+        delete furniCache[oldestHotel]
+      }
+
       furniCache[hotel] = { data, fetchedAt: Date.now() }
     } catch {
       return res.status(502).json({ error: "Falha ao buscar furnidata." })
@@ -130,8 +199,56 @@ router.get("/image-url", async (req, res) => {
     } catch { }
   }
 
-  imageUrlCache.set(cacheKey, resolvedUrl)
+  setCacheValue(imageUrlCache, cacheKey, resolvedUrl)
   res.json({ url: resolvedUrl })
+})
+
+router.get("/image-icon", async (req, res) => {
+  const { classname, hotel = "br" } = req.query
+  if (!classname) {
+    return res.status(400).json({ error: "classname obrigatório." })
+  }
+
+  // validação básica
+  if (!classname.match(/^[a-z0-9\-_*]+$/i)) {
+    return res.status(400).json({ error: "classname inválido." })
+  }
+
+  const base = classname.replace("*", "_")
+
+  let data = furniCache[hotel]?.data
+  if (!data) {
+    try {
+      const response = await fetchWithTimeout(
+        `${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`
+      )
+      if (!response.ok) throw new Error()
+      data = await response.json()
+
+      furniCache[hotel] = { data, fetchedAt: Date.now() }
+    } catch {
+      return res.status(502).json({ error: "Falha ao buscar furnidata." })
+    }
+  }
+
+  const allItems = [
+    ...(data?.roomitemtypes?.furnitype ?? []),
+    ...(data?.wallitemtypes?.furnitype ?? []),
+  ]
+
+  const found = allItems.find(
+    (i) => i.classname === classname || i.classname === base
+  )
+
+  const revision = found?.revision
+
+  if (!revision) {
+    return res.status(404).json({ error: "Item não encontrado." })
+  }
+
+  const url = `https://images.habbo.com/dcr/hof_furni/${revision}/${base}_icon.png`
+
+  res.json({ url })
 })
 
 export default router
