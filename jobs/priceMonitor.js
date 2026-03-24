@@ -7,9 +7,8 @@ import { redisPublisher } from "../services/redis.js";
 
 const ITEM_DELAY_MS = 300;
 const MAX_NOTIFICATIONS = 50;
-const MONITOR_INTERVAL_MS = 30 * 1000; // todos os itens são checados a cada 30s
+const MONITOR_INTERVAL_MS = 30 * 1000;
 
-// Busca itens que precisam ser verificados agora, agrupados por hotel
 async function fetchItemsDue() {
   const cutoff = new Date(Date.now() - MONITOR_INTERVAL_MS);
 
@@ -27,7 +26,6 @@ async function fetchItemsDue() {
   return rows;
 }
 
-// Agrupa itens por hotel para fazer batch por hotel
 function groupByHotel(items) {
   const map = new Map();
 
@@ -145,9 +143,41 @@ async function processHotelBatch(hotel, items) {
       newPrice,
     });
 
-    if (!oldPrice || oldPrice === newPrice) continue;
+    // Primeira detecção — publica evento mas sem diff/notificação
+    if (oldPrice == null) {
+      const event = {
+        id: crypto.randomUUID(),
+        type: "price_changed",
+        className: item.classname,
+        classname: item.classname,
+        furniName: item.furni_name,
+        hotel,
+        oldPrice: null,
+        newPrice,
+        diff: 0,
+        pct: 0,
+        direction: "up",
+        detectedAt: Date.now(),
+        timestamp: Date.now(),
+      };
 
-    // Salva no histórico
+      try {
+        await redisPublisher.publish(
+          "habbip:price_events",
+          JSON.stringify(event),
+        );
+        console.log(`[Monitor] ${item.classname}/${hotel} primeira detecção: ${newPrice}`);
+      } catch (err) {
+        console.error("[Monitor] Erro ao publicar primeira detecção:", err.message);
+      }
+
+      continue;
+    }
+
+    // Preço não mudou — nada a fazer
+    if (oldPrice === newPrice) continue;
+
+    // Preço mudou — salva histórico e notifica
     await pool.query(
       `INSERT INTO price_history (classname, hotel, price)
        VALUES ($1, $2, $3)`,
@@ -156,11 +186,9 @@ async function processHotelBatch(hotel, items) {
 
     const diff = newPrice - oldPrice;
     const pct = parseFloat(((diff / oldPrice) * 100).toFixed(1));
-
     const detectedAt = Date.now();
     const eventId = crypto.randomUUID();
 
-    // Publica no Redis — a API vai distribuir para os SSE dos usuários inscritos
     const event = {
       id: eventId,
       type: "price_changed",
