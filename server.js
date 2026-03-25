@@ -23,45 +23,59 @@ app.use(cors({
 }))
 app.use(express.json({ limit: "2mb" }))
 
-// Rate limiting global
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Muitas requisições. Tente novamente em alguns minutos." },
-}))
+// ── Rate limiters específicos ──────────────────────────────────────────────
 
-// Rate limiting mais restrito para auth
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { error: "Muitas tentativas de login. Aguarde 15 minutos." },
 })
 
-// Rate limiting específico para user data (escritas)
-// Usa userId quando disponível, caso contrário usa ipKeyGenerator para suporte a IPv6
 const userDataLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minuto
+  windowMs: 60 * 1000,
   max: 30,
   keyGenerator: (req) => {
-    // Se usuário autenticado, usa userId como chave
-    if (req.userId) {
-      return `user:${req.userId}`
-    }
-    // Fallback para IP com suporte correto a IPv6
+    if (req.userId) return `user:${req.userId}`
     return ipKeyGenerator(req)
   },
   message: { error: "Muitas alterações. Aguarde um minuto." },
 })
 
-// ── Rotas ──────────────────────────────────────────────────────────────────
+const furniLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 60,
+  message: { error: "Muitas buscas. Aguarde um momento." },
+})
+
+const sseLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: "Muitas conexões. Tente novamente em alguns minutos." },
+})
+
+const subscriptionsLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 60,
+  message: { error: "Muitas requisições. Aguarde um momento." },
+})
+
+// ── Rotas sem rate limit global (têm limiters próprios) ───────────────────
+app.use("/api/furnidata", furniLimiter, furniDataRoutes)
+app.use("/api/stream", sseLimiter, streamRoutes)
+app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
+
+// ── Rate limiting global ───────────────────────────────────────────────────
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas requisições. Tente novamente em alguns minutos." },
+}))
+
+// ── Rotas com rate limit global ───────────────────────────────────────────
 app.use("/api/auth", authLimiter, authRoutes)
 app.use("/api/user", userDataLimiter, userDataRoutes)
-app.use("/api/furnidata", furniDataRoutes)
-
-app.use('/api/stream', streamRoutes)
-app.use('/api/subscriptions', subscriptionRoutes)
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: Date.now() })
@@ -81,16 +95,7 @@ app.use((err, req, res, _next) => {
 let priceMonitorInterval = null
 let tokenCleanupInterval = null
 
-// ── Limpeza de refresh tokens expirados ───────────────────────────────────
-//
-// Tokens com expires_at < NOW() nunca são removidos automaticamente durante
-// o uso normal (só no logout explícito). Com o tempo, a tabela refresh_tokens
-// acumula registros mortos que ocupam espaço e degradam queries de leitura.
-//
-// Este job roda uma vez ao iniciar (para limpar acúmulo histórico) e depois
-// a cada 24h. Usa um try/catch isolado para nunca derrubar o servidor em caso
-// de falha pontual de conexão com o banco.
-const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000 // 24 horas
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 async function cleanExpiredTokens() {
   try {
@@ -101,15 +106,12 @@ async function cleanExpiredTokens() {
       console.log(`[TokenCleanup] ${rowCount} token(s) expirado(s) removido(s).`)
     }
   } catch (err) {
-    // Loga mas não propaga — falha aqui não deve afetar o servidor
     console.error("[TokenCleanup] Erro ao limpar tokens expirados:", err.message)
   }
 }
 
 function startTokenCleanup() {
-  // Roda imediatamente ao iniciar para limpar acúmulo histórico
   cleanExpiredTokens()
-  // Depois a cada 24h
   tokenCleanupInterval = setInterval(cleanExpiredTokens, CLEANUP_INTERVAL_MS)
   console.log("[TokenCleanup] Job de limpeza iniciado (intervalo: 24h).")
 }
@@ -118,15 +120,9 @@ function startTokenCleanup() {
 function gracefulShutdown(signal) {
   console.log(`\n${signal} recebido, desligando gracefully...`)
 
-  // Limpar intervalos
-  if (priceMonitorInterval) {
-    clearInterval(priceMonitorInterval)
-  }
-  if (tokenCleanupInterval) {
-    clearInterval(tokenCleanupInterval)
-  }
+  if (priceMonitorInterval) clearInterval(priceMonitorInterval)
+  if (tokenCleanupInterval) clearInterval(tokenCleanupInterval)
 
-  // Encerrar pool de conexões
   pool.end()
     .then(() => {
       console.log("Pool de conexões encerrado.")
@@ -145,8 +141,8 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 async function start() {
   await initDb()
   await warmupFurniCache()
-  await connectRedis()        // ← novo
-  await initSSESubscriber()   // ← novo
+  await connectRedis()
+  await initSSESubscriber()
   startPriceMonitor()
   startTokenCleanup()
   app.listen(PORT, () => {
