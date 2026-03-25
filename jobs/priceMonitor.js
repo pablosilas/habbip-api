@@ -228,73 +228,70 @@ async function processHotelBatch(hotel, items) {
   }
 }
 
+// Substitua createNotificationsForSubscribers inteira
+
 async function createNotificationsForSubscribers(classname, hotel, event) {
   const { rows: subs } = await pool.query(
     `SELECT user_id, alert_config
      FROM user_subscriptions
-     WHERE classname = $1
-       AND hotel = $2
-       AND active = TRUE`,
-    [classname, hotel],
-  );
+     WHERE classname = $1 AND hotel = $2 AND active = TRUE`,
+    [classname, hotel]
+  )
 
-  for (const sub of subs) {
-    const cfg = sub.alert_config || { alertMode: "any" };
-    let shouldNotify = false;
+  // Filtra quem deve receber a notificação
+  const eligibleUserIds = subs
+    .filter((sub) => {
+      const cfg = sub.alert_config || { alertMode: "any" }
+      if (cfg.alertMode === "any") return true
+      if (cfg.alertMode === "price" && cfg.targetPrice != null) {
+        const margin = cfg.priceMargin ?? 0
+        return (
+          event.newPrice >= cfg.targetPrice - margin &&
+          event.newPrice <= cfg.targetPrice + margin
+        )
+      }
+      return false
+    })
+    .map((sub) => sub.user_id)
 
-    if (cfg.alertMode === "any") {
-      shouldNotify = true;
-    } else if (cfg.alertMode === "price" && cfg.targetPrice != null) {
-      const margin = cfg.priceMargin ?? 0;
-      shouldNotify =
-        event.newPrice >= cfg.targetPrice - margin &&
-        event.newPrice <= cfg.targetPrice + margin;
-    }
+  if (eligibleUserIds.length === 0) return
 
-    if (!shouldNotify) continue;
-
-    const notif = {
-      id: `${classname}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      className: classname,
-      classname,
-      furniName: event.furniName,
-      oldPrice: event.oldPrice,
-      newPrice: event.newPrice,
-      diff: event.diff,
-      pct: event.pct,
-      direction: event.direction,
-      hotel,
-      read: false,
-      createdAt: Date.now(),
-      source: "background",
-      detectedAt: event.detectedAt ?? null,
-      publishAt: event.publishAt ?? null,
-    };
-
-    await prependNotification(sub.user_id, notif);
+  const notif = {
+    id: `${classname}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    className: classname,
+    classname,
+    furniName: event.furniName,
+    oldPrice: event.oldPrice,
+    newPrice: event.newPrice,
+    diff: event.diff,
+    pct: event.pct,
+    direction: event.direction,
+    hotel,
+    read: false,
+    createdAt: Date.now(),
+    source: "background",
+    detectedAt: event.detectedAt ?? null,
+    publishAt: event.publishAt ?? null,
   }
-}
 
-async function prependNotification(userId, notif) {
-  const { rows } = await pool.query(
-    `SELECT notifications
-     FROM user_data
-     WHERE user_id = $1`,
-    [userId],
-  );
+  const notifJson = JSON.stringify(notif)
 
-  const current = Array.isArray(rows[0]?.notifications)
-    ? rows[0].notifications
-    : [];
-
-  const next = [notif, ...current].slice(0, MAX_NOTIFICATIONS);
-
+  // Um único UPDATE para todos os usuários elegíveis de uma vez
   await pool.query(
     `UPDATE user_data
-     SET notifications = $1::jsonb
-     WHERE user_id = $2`,
-    [JSON.stringify(next), userId],
-  );
+     SET notifications = (
+       SELECT jsonb_agg(elem)
+       FROM (
+         SELECT elem
+         FROM jsonb_array_elements(
+           jsonb_build_array($1::jsonb) || COALESCE(notifications, '[]'::jsonb)
+         ) AS elem
+         LIMIT $3
+       ) sub
+     )
+     WHERE user_id = ANY($2::int[])`,
+    [notifJson, eligibleUserIds, MAX_NOTIFICATIONS]
+  )
 }
 
 async function runPriceMonitor() {
@@ -318,11 +315,29 @@ async function runPriceMonitor() {
   console.log("[Monitor] Ciclo concluído");
 }
 
+let monitorRunning = false
+
+async function runLoop() {
+  if (monitorRunning) {
+    console.warn("[Monitor] Ciclo anterior ainda em execução, pulando.")
+    setTimeout(runLoop, MONITOR_INTERVAL_MS)
+    return
+  }
+
+  monitorRunning = true
+  try {
+    await runPriceMonitor()
+  } catch (err) {
+    console.error("[Monitor] Erro não tratado no ciclo:", err.message)
+  } finally {
+    monitorRunning = false
+    setTimeout(runLoop, MONITOR_INTERVAL_MS)
+  }
+}
+
 export function startPriceMonitor() {
   console.log(
-    `[Monitor] Iniciado — ciclos a cada ${MONITOR_INTERVAL_MS / 1000}s, sem prioridade`,
-  );
-
-  runPriceMonitor();
-  setInterval(runPriceMonitor, 15 * 1000);
+    `[Monitor] Iniciado — ciclos encadeados com intervalo de ${MONITOR_INTERVAL_MS / 1000}s após cada execução`,
+  )
+  runLoop()
 }

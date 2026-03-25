@@ -2,6 +2,7 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/auth.js'
 import { pool } from '../db.js'
+import { invalidateSubscriptionCache } from './stream.js'
 
 const router = Router()
 router.use(requireAuth)
@@ -63,6 +64,7 @@ router.post('/', async (req, res) => {
     )
 
     await client.query('COMMIT')
+    invalidateSubscriptionCache(classname, hotel)
     res.json({ ok: true })
   } catch (err) {
     await client.query('ROLLBACK')
@@ -93,7 +95,7 @@ router.delete('/:classname', async (req, res) => {
      WHERE classname = $1 AND hotel = $2`,
     [classname, hotel]
   )
-
+  invalidateSubscriptionCache(classname, req.query.hotel ?? 'br')
   res.json({ ok: true })
 })
 
@@ -107,7 +109,7 @@ router.patch('/:classname/alert', async (req, res) => {
      WHERE user_id = $2 AND classname = $3 AND hotel = $4 AND active = TRUE`,
     [JSON.stringify(alertConfig), req.userId, classname, hotel]
   )
-
+  invalidateSubscriptionCache(classname, req.body?.hotel ?? 'br')
   res.json({ ok: true })
 })
 

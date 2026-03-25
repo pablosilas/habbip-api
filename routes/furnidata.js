@@ -1,4 +1,6 @@
+// routes/furnidata.js
 import express from "express"
+import { cacheGet, cacheSet } from "../services/redis.js"
 
 const router = express.Router()
 
@@ -14,15 +16,13 @@ const hotelMap = {
   tr: "https://www.habbo.com.tr",
 }
 
-
+// Cache L1 — memória local do processo (evita round-trip ao Redis)
 let furniCache = {}
-const CACHE_TTL_MS = 60 * 60 * 1000 // 1 hora
-const MAX_CACHE_HOTELS = 10 // Limite máximo de hotéis em cache
+const CACHE_TTL_MS = 60 * 60 * 1000      // 1h em memória
+const REDIS_TTL_S = 60 * 60             // 1h no Redis
+const MAX_CACHE_HOTELS = 10
 const DEFAULT_FETCH_TIMEOUT_MS = 5000
 
-/**
- * Faz fetch com timeout para evitar travamentos
- */
 function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
   return Promise.race([
     fetch(url, options),
@@ -35,40 +35,75 @@ function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_M
   ])
 }
 
+// ── Helper central de furnidata ───────────────────────────────────────────
+// Lógica de cache em três camadas: memória → Redis → Habbo
+async function getFurniData(hotel) {
+  // 1. Cache L1: memória local (mais rápido)
+  if (furniCache[hotel] && Date.now() - furniCache[hotel].fetchedAt < CACHE_TTL_MS) {
+    return furniCache[hotel].data
+  }
+
+  // 2. Cache L2: Redis (compartilhado entre instâncias)
+  const redisData = await cacheGet(`furnidata:${hotel}`).catch(() => null)
+  if (redisData) {
+    // Popula L1 para as próximas requisições nesta instância
+    furniCache[hotel] = { data: redisData, fetchedAt: Date.now() }
+    return redisData
+  }
+
+  // 3. Fonte: API do Habbo
+  const baseUrl = hotelMap[hotel] || hotelMap.br
+  const response = await fetchWithTimeout(`${baseUrl}/gamedata/furnidata_json/1`)
+  if (!response.ok) throw new Error(`Habbo retornou ${response.status}`)
+  const data = await response.json()
+
+  // Evita crescimento ilimitado do cache local
+  if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
+    const oldest = Object.entries(furniCache)
+      .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
+    delete furniCache[oldest]
+  }
+
+  // Salva em L1 e L2
+  furniCache[hotel] = { data, fetchedAt: Date.now() }
+  await cacheSet(`furnidata:${hotel}`, data, REDIS_TTL_S).catch(() => {
+    // Redis indisponível não deve quebrar a rota — só loga
+    console.warn(`[furnidata] Falha ao salvar hotel=${hotel} no Redis`)
+  })
+
+  console.log(`[furnidata] buscado do Habbo: ${hotel}`)
+  return data
+}
+
+// ── Warmup ────────────────────────────────────────────────────────────────
 export async function warmupFurniCache() {
   try {
+    // Tenta Redis antes de ir ao Habbo
+    const cached = await cacheGet("furnidata:br").catch(() => null)
+    if (cached) {
+      furniCache["br"] = { data: cached, fetchedAt: Date.now() }
+      console.log("[warmup] furnidata br carregado do Redis")
+      return
+    }
+
     const res = await fetchWithTimeout("https://www.habbo.com.br/gamedata/furnidata_json/1")
     if (!res.ok) return
     const data = await res.json()
+
     furniCache["br"] = { data, fetchedAt: Date.now() }
-    console.log("[warmup] furnidata br carregado")
+    await cacheSet("furnidata:br", data, REDIS_TTL_S).catch(() => { })
+    console.log("[warmup] furnidata br carregado do Habbo e salvo no Redis")
   } catch (err) {
     console.warn("[warmup] falhou:", err.message)
   }
 }
 
+// ── GET /api/furnidata ────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   const hotel = req.query.hotel || "br"
-  const baseUrl = hotelMap[hotel] || hotelMap.br
-
-  if (furniCache[hotel] && Date.now() - furniCache[hotel].fetchedAt < CACHE_TTL_MS) {
-    return res.json(furniCache[hotel].data)
-  }
 
   try {
-    const response = await fetchWithTimeout(`${baseUrl}/gamedata/furnidata_json/1`)
-    if (!response.ok) throw new Error(`Habbo retornou ${response.status}`)
-    const data = await response.json()
-
-    // Implementar limite de tamanho: remover hotel mais antigo se necessário
-    if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
-      const oldestHotel = Object.entries(furniCache)
-        .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
-      delete furniCache[oldestHotel]
-    }
-
-    furniCache[hotel] = { data, fetchedAt: Date.now() }
-    console.log(`[furnidata] buscado do Habbo: ${hotel}`)
+    const data = await getFurniData(hotel)
     res.json(data)
   } catch (err) {
     console.error("[furnidata] erro:", err.message)
@@ -76,40 +111,26 @@ router.get("/", async (req, res) => {
   }
 })
 
+// ── GET /api/furnidata/search ─────────────────────────────────────────────
 router.get("/search", async (req, res) => {
   const { q, hotel = "br" } = req.query
-  if (!q?.trim()) return res.json([])
 
+  if (!q?.trim()) return res.json([])
   if (q.trim().length < 2) {
-    return res.status(400).json({ error: "Digite pelo menos 3 caracteres." })
+    return res.status(400).json({ error: "Digite pelo menos 2 caracteres." })
   }
 
-  // Reutiliza o cache do furnidata
-  let data = furniCache[hotel]?.data
-  if (!data) {
-    try {
-      const response = await fetchWithTimeout(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
-      if (!response.ok) throw new Error()
-      data = await response.json()
-
-      // Implementar limite de tamanho
-      if (Object.keys(furniCache).length >= MAX_CACHE_HOTELS && !furniCache[hotel]) {
-        const oldestHotel = Object.entries(furniCache)
-          .sort(([, a], [, b]) => a.fetchedAt - b.fetchedAt)[0][0]
-        delete furniCache[oldestHotel]
-      }
-
-      furniCache[hotel] = { data, fetchedAt: Date.now() }
-    } catch {
-      return res.status(502).json({ error: "Falha ao buscar furnidata." })
-    }
+  let data
+  try {
+    data = await getFurniData(hotel)
+  } catch {
+    return res.status(502).json({ error: "Falha ao buscar furnidata." })
   }
 
   const term = q.trim().toLowerCase()
-
   const RESULT_LIMIT = 400
   const allItems = []
-  
+
   for (const i of data?.roomitemtypes?.furnitype ?? []) {
     if (!i.name?.toLowerCase().includes(term)) continue
     allItems.push({ classname: i.classname, furniName: i.name, furniType: "roomItem", revision: i.revision })
@@ -129,16 +150,16 @@ router.get("/search", async (req, res) => {
   res.json(allItems)
 })
 
+// ── Caches para image-url ─────────────────────────────────────────────────
+// L1 continua em memória (URLs de imagem mudam raramente, não vale Redis)
 const imageUrlCache = new Map()
 const imageUrlPending = new Map()
 
 function getCacheValue(map, key) {
   if (!map.has(key)) return undefined
-
   const value = map.get(key)
   map.delete(key)
   map.set(key, value)
-
   return value
 }
 
@@ -149,14 +170,13 @@ function setCacheValue(map, key, value, maxSize = 500) {
     const oldestKey = map.keys().next().value
     map.delete(oldestKey)
   }
-
   map.set(key, value)
 }
 
+// ── GET /api/furnidata/image-url ──────────────────────────────────────────
 router.get("/image-url", async (req, res) => {
   const { classname, hotel = "br" } = req.query
   if (!classname) return res.status(400).json({ error: "classname obrigatório." })
-
   if (!classname.match(/^[a-z0-9\-_*]+$/i)) {
     return res.status(400).json({ error: "classname inválido." })
   }
@@ -164,11 +184,9 @@ router.get("/image-url", async (req, res) => {
   const base = classname.replace("*", "_")
   const cacheKey = `${base}:${hotel}`
 
-  // 1. Cache — responde imediatamente
   const cached = getCacheValue(imageUrlCache, cacheKey)
   if (cached !== undefined) return res.json({ url: cached })
 
-  // 2. Já há fetch em andamento para este classname — aguarda
   if (imageUrlPending.has(cacheKey)) {
     try {
       const url = await imageUrlPending.get(cacheKey)
@@ -178,17 +196,11 @@ router.get("/image-url", async (req, res) => {
     }
   }
 
-  // 3. Garante furnidata em cache
-  let data = furniCache[hotel]?.data
-  if (!data) {
-    try {
-      const response = await fetchWithTimeout(`${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`)
-      if (!response.ok) throw new Error()
-      data = await response.json()
-      furniCache[hotel] = { data, fetchedAt: Date.now() }
-    } catch {
-      return res.status(502).json({ error: "Falha ao buscar furnidata." })
-    }
+  let data
+  try {
+    data = await getFurniData(hotel)
+  } catch {
+    return res.status(502).json({ error: "Falha ao buscar furnidata." })
   }
 
   const allItems = [
@@ -204,7 +216,6 @@ router.get("/image-url", async (req, res) => {
     `https://habboapi.site/api/image/${encodeURIComponent(classname)}`,
   ].filter(Boolean)
 
-  // 4. Registra promise para que requisições simultâneas aguardem
   const resolvePromise = (async () => {
     let resolvedUrl = ""
     for (const url of candidates) {
@@ -228,33 +239,21 @@ router.get("/image-url", async (req, res) => {
   }
 })
 
-
+// ── GET /api/furnidata/image-icon ─────────────────────────────────────────
 router.get("/image-icon", async (req, res) => {
   const { classname, hotel = "br" } = req.query
-  if (!classname) {
-    return res.status(400).json({ error: "classname obrigatório." })
-  }
-
-  // validação básica
+  if (!classname) return res.status(400).json({ error: "classname obrigatório." })
   if (!classname.match(/^[a-z0-9\-_*]+$/i)) {
     return res.status(400).json({ error: "classname inválido." })
   }
 
   const base = classname.replace("*", "_")
 
-  let data = furniCache[hotel]?.data
-  if (!data) {
-    try {
-      const response = await fetchWithTimeout(
-        `${hotelMap[hotel] || hotelMap.br}/gamedata/furnidata_json/1`
-      )
-      if (!response.ok) throw new Error()
-      data = await response.json()
-
-      furniCache[hotel] = { data, fetchedAt: Date.now() }
-    } catch {
-      return res.status(502).json({ error: "Falha ao buscar furnidata." })
-    }
+  let data
+  try {
+    data = await getFurniData(hotel)
+  } catch {
+    return res.status(502).json({ error: "Falha ao buscar furnidata." })
   }
 
   const allItems = [
@@ -262,10 +261,7 @@ router.get("/image-icon", async (req, res) => {
     ...(data?.wallitemtypes?.furnitype ?? []),
   ]
 
-  const found = allItems.find(
-    (i) => i.classname === classname || i.classname === base
-  )
-
+  const found = allItems.find(i => i.classname === classname || i.classname === base)
   const revision = found?.revision
 
   if (!revision) {
@@ -273,7 +269,6 @@ router.get("/image-icon", async (req, res) => {
   }
 
   const url = `https://images.habbo.com/dcr/hof_furni/${revision}/${base}_icon.png`
-
   res.json({ url })
 })
 
