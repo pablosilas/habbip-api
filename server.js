@@ -43,7 +43,7 @@ const userDataLimiter = rateLimit({
 
 const furniLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
-  max: 60,
+  max: 500,
   message: { error: "Muitas buscas. Aguarde um momento." },
 })
 
