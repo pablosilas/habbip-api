@@ -1,11 +1,27 @@
 import { Router } from "express"
+import rateLimit, { ipKeyGenerator } from "express-rate-limit"
 import { pool } from "../db.js"
 import { requireAuth } from "../middleware/auth.js"
 
 const router = Router()
 
+const userDataLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyGenerator: (req) => {
+    if (req.userId) return `user:${req.userId}`
+    return ipKeyGenerator(req)
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas alterações. Aguarde um minuto." },
+})
+
 // Todos os endpoints de dados exigem autenticação
 router.use(requireAuth)
+
+// Aplica o limiter depois do requireAuth
+router.use(userDataLimiter)
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -91,7 +107,6 @@ router.put("/data/:field", async (req, res) => {
       return res.status(400).json({ error: "Campo 'value' não fornecido." })
     }
 
-    // Validar tamanho dos dados
     try {
       validateJsonSize(value)
     } catch (err) {
@@ -124,7 +139,6 @@ router.put("/data", async (req, res) => {
       return res.status(400).json({ error: "Nenhum campo válido fornecido." })
     }
 
-    // Validar tamanho de todos os campos
     for (const field of fields) {
       try {
         validateJsonSize(updates[field])
@@ -135,7 +149,6 @@ router.put("/data", async (req, res) => {
 
     await ensureUserData(req.userId)
 
-    // Monta SET dinâmico com placeholders
     const setClauses = fields.map((f, i) => `${f} = $${i + 1}`)
     const values = fields.map((f) => JSON.stringify(updates[f]))
     values.push(req.userId)

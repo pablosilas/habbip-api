@@ -2,7 +2,7 @@ import "dotenv/config"
 import express from "express"
 import cors from "cors"
 import helmet from "helmet"
-import rateLimit, { ipKeyGenerator } from "express-rate-limit"
+import rateLimit from "express-rate-limit"
 import { pool, initDb } from "./db.js"
 import authRoutes from "./routes/auth.js"
 import { startPriceMonitor } from "./jobs/priceMonitor.js"
@@ -28,40 +28,30 @@ app.use(express.json({ limit: "2mb" }))
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: "Muitas tentativas de login. Aguarde 15 minutos." },
-})
-
-const userDataLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  keyGenerator: (req) => {
-    if (req.userId) return `user:${req.userId}`
-    return ipKeyGenerator(req)
-  },
-  message: { error: "Muitas alterações. Aguarde um minuto." },
 })
 
 const furniLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 500,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: "Muitas buscas. Aguarde um momento." },
-})
-
-const sseLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: "Muitas conexões. Tente novamente em alguns minutos." },
 })
 
 const subscriptionsLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: "Muitas requisições. Aguarde um momento." },
 })
 
 // ── Rotas sem rate limit global (têm limiters próprios) ───────────────────
 app.use("/api/furnidata", furniLimiter, furniDataRoutes)
-app.use("/api/stream", sseLimiter, streamRoutes)
+app.use("/api/stream", streamRoutes)
 app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
 
 // ── Rate limiting global ───────────────────────────────────────────────────
@@ -75,7 +65,7 @@ app.use(rateLimit({
 
 // ── Rotas com rate limit global ───────────────────────────────────────────
 app.use("/api/auth", authLimiter, authRoutes)
-app.use("/api/user", userDataLimiter, userDataRoutes)
+app.use("/api/user", userDataRoutes)
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: Date.now() })
@@ -116,7 +106,7 @@ function startTokenCleanup() {
   console.log("[TokenCleanup] Job de limpeza iniciado (intervalo: 24h).")
 }
 
-// ── Graceful Shutdown ─────────────────────────────────────────────────────
+// ── Graceful Shutdown ──────────────────────────────────────────────────────
 function gracefulShutdown(signal) {
   console.log(`\n${signal} recebido, desligando gracefully...`)
 
@@ -134,8 +124,8 @@ function gracefulShutdown(signal) {
     })
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
-process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
+process.on("SIGINT", () => gracefulShutdown("SIGINT"))
 
 // ── Inicialização ──────────────────────────────────────────────────────────
 async function start() {
