@@ -35,7 +35,7 @@ const authLimiter = rateLimit({
 
 const furniLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
-  max: 500,
+  max: 2000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Muitas buscas. Aguarde um momento." },
@@ -54,7 +54,7 @@ app.use("/api/furnidata", furniLimiter, furniDataRoutes)
 app.use("/api/stream", streamRoutes)
 app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
 
-// ── Rate limiting global ───────────────────────────────────────────────────
+// ── Rate limiting global ─────────────────────  ──────────────────────────────
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
