@@ -12,13 +12,14 @@ import {
 const router = Router()
 const BCRYPT_ROUNDS = 12
 
-// Nick do Habbo: 1-32 chars
+// Nick do Habbo: 1-64 chars
 function isValidNick(n) {
   return typeof n === "string" && n.trim().length >= 1 && n.trim().length <= 64
 }
 
-function isValidPassword(p) {
-  return typeof p === "string" && p.length >= 6 && p.length <= 128
+// PIN: 4 a 6 dígitos numéricos
+function isValidPin(p) {
+  return typeof p === "string" && /^\d{4,6}$/.test(p)
 }
 
 function hashToken(token) {
@@ -30,13 +31,13 @@ router.post("/register", async (req, res) => {
   const { habboNick, password } = req.body ?? {}
 
   if (!habboNick || !password) {
-    return res.status(400).json({ error: "Nick e senha são obrigatórios." })
+    return res.status(400).json({ error: "Nick e PIN são obrigatórios." })
   }
   if (!isValidNick(habboNick)) {
     return res.status(400).json({ error: "Nick inválido." })
   }
-  if (!isValidPassword(password)) {
-    return res.status(400).json({ error: "Senha deve ter entre 6 e 128 caracteres." })
+  if (!isValidPin(password)) {
+    return res.status(400).json({ error: "PIN deve ter entre 4 e 6 dígitos numéricos." })
   }
 
   const nick = habboNick.trim()
@@ -97,7 +98,7 @@ router.post("/login", async (req, res) => {
   const { habboNick, password } = req.body ?? {}
 
   if (!habboNick || !password) {
-    return res.status(400).json({ error: "Nick e senha são obrigatórios." })
+    return res.status(400).json({ error: "Nick e PIN são obrigatórios." })
   }
 
   const { rows } = await pool.query(
@@ -113,7 +114,7 @@ router.post("/login", async (req, res) => {
     : await bcrypt.compare(password, "$2a$12$invalidhashtopreventtimingattack1234567890")
 
   if (!user || !passwordOk) {
-    return res.status(401).json({ error: "Nick ou senha incorretos." })
+    return res.status(401).json({ error: "Nick ou PIN incorretos." })
   }
 
   const accessToken = signAccessToken({ userId: user.id, habboNick: user.habbo_nick })
@@ -211,13 +212,13 @@ router.patch("/me", requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body ?? {}
 
   if (!newPassword) {
-    return res.status(400).json({ error: "Nova senha é obrigatória." })
+    return res.status(400).json({ error: "Novo PIN é obrigatório." })
   }
   if (!currentPassword) {
-    return res.status(400).json({ error: "Senha atual é necessária." })
+    return res.status(400).json({ error: "PIN atual é necessário." })
   }
-  if (!isValidPassword(newPassword)) {
-    return res.status(400).json({ error: "Nova senha deve ter entre 6 e 128 caracteres." })
+  if (!isValidPin(newPassword)) {
+    return res.status(400).json({ error: "Novo PIN deve ter entre 4 e 6 dígitos numéricos." })
   }
 
   const { rows } = await pool.query(
@@ -226,7 +227,7 @@ router.patch("/me", requireAuth, async (req, res) => {
   )
   const ok = await bcrypt.compare(currentPassword, rows[0].password_hash)
   if (!ok) {
-    return res.status(401).json({ error: "Senha atual incorreta." })
+    return res.status(401).json({ error: "PIN atual incorreto." })
   }
 
   await pool.query(
