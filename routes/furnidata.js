@@ -132,7 +132,7 @@ router.get("/search", async (req, res) => {
   const allItems = []
 
   for (const i of data?.roomitemtypes?.furnitype ?? []) {
-    if (!i.name?.toLowerCase().includes(term)) continue
+    if (!i.name?.toLowerCase().includes(term) && !i.classname?.toLowerCase().includes(term)) continue   
     allItems.push({ classname: i.classname, furniName: i.name, furniType: "roomItem", revision: i.revision })
     if (allItems.length > RESULT_LIMIT) {
       return res.status(200).json({ tooMany: true, total: ">400", items: [] })
@@ -140,7 +140,7 @@ router.get("/search", async (req, res) => {
   }
 
   for (const i of data?.wallitemtypes?.furnitype ?? []) {
-    if (!i.name?.toLowerCase().includes(term)) continue
+    if (!i.name?.toLowerCase().includes(term) && !i.classname?.toLowerCase().includes(term)) continue
     allItems.push({ classname: i.classname, furniName: i.name, furniType: "wallItem", revision: i.revision })
     if (allItems.length > RESULT_LIMIT) {
       return res.status(200).json({ tooMany: true, total: ">400", items: [] })
@@ -258,7 +258,7 @@ router.get("/image-icon", async (req, res) => {
 
   const allItems = [
     ...(data?.roomitemtypes?.furnitype ?? []),
-    ...(data?.wallitemtypes?.furnitype ?? []),
+    ...(data?.wallitemtypes?.furnitype ?? []),    
   ]
 
   const found = allItems.find(i => i.classname === classname || i.classname === base)
