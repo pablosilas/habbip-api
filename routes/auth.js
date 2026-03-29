@@ -19,7 +19,7 @@ function isValidNick(n) {
 
 // PIN: 4 a 6 dígitos numéricos
 function isValidPin(p) {
-  return typeof p === "string" && /^\d{4,6}$/.test(p)
+  return typeof p === "string" && /^\d{6}$/.test(p)
 }
 
 function hashToken(token) {
@@ -37,7 +37,7 @@ router.post("/register", async (req, res) => {
     return res.status(400).json({ error: "Nick inválido." })
   }
   if (!isValidPin(password)) {
-    return res.status(400).json({ error: "PIN deve ter entre 4 e 6 dígitos numéricos." })
+    return res.status(400).json({ error: "PIN deve ter 6 dígitos numéricos." })
   }
 
   const nick = habboNick.trim()
@@ -218,7 +218,7 @@ router.patch("/me", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "PIN atual é necessário." })
   }
   if (!isValidPin(newPassword)) {
-    return res.status(400).json({ error: "Novo PIN deve ter entre 4 e 6 dígitos numéricos." })
+    return res.status(400).json({ error: "Novo PIN deve ter 6 dígitos numéricos." })
   }
 
   const { rows } = await pool.query(
