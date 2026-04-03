@@ -213,16 +213,17 @@ async function processHotelBatch(hotel, items) {
         `[Monitor] ${event.className}/${hotel} detectado -> publish: ${publishAt - detectedAt}ms`,
       );
 
+      // Cria notificações no banco para os inscritos (fallback se SSE cair)
+      await createNotificationsForSubscribers(item.classname, hotel, event);
+
       await redisPublisher.publish(
         "habbip:price_events",
         JSON.stringify(event),
       );
+      
     } catch (err) {
       console.error("[Monitor] Erro ao publicar no Redis:", err.message);
     }
-
-    // Cria notificações no banco para os inscritos (fallback se SSE cair)
-    await createNotificationsForSubscribers(item.classname, hotel, event);
 
     await new Promise((r) => setTimeout(r, ITEM_DELAY_MS));
   }
