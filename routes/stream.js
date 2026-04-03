@@ -8,7 +8,7 @@ const router = Router()
 
 const sseLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 30,
   keyGenerator: (req) => {
     if (req.userId) return `user:${req.userId}`
     return ipKeyGenerator(req)
@@ -162,7 +162,7 @@ router.get("/", requireAuth, sseLimiter, (req, res) => {
     } catch {
       cleanup()
     }
-  }, 25000)
+  }, 20000) 
 
   res.write(
     `data: ${JSON.stringify({ type: "connected", userId: req.userId })}\n\n`
