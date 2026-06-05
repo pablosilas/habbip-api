@@ -6,10 +6,13 @@ import rateLimit from "express-rate-limit"
 import { pool, initDb } from "./db.js"
 import authRoutes from "./routes/auth.js"
 import { startPriceMonitor } from "./jobs/priceMonitor.js"
+import { startTrendingMonitor, stopTrendingMonitor } from "./jobs/trendingMonitor.js"
 import userDataRoutes from "./routes/userData.js"
 import furniDataRoutes, { warmupFurniCache } from "./routes/furnidata.js"
 import streamRoutes, { initSSESubscriber } from "./routes/stream.js"
 import subscriptionRoutes from "./routes/subscriptions.js"
+import paymentRoutes from "./routes/payment.js"
+import trendingRoutes from "./routes/trending.js"
 import { connectRedis } from "./services/redis.js"
 
 const app = express()
@@ -49,10 +52,19 @@ const subscriptionsLimiter = rateLimit({
   message: { error: "Muitas requisições. Aguarde um momento." },
 })
 
+const paymentLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas requisições de pagamento. Aguarde." },
+})
+
 // ── Rotas sem rate limit global (têm limiters próprios) ───────────────────
 app.use("/api/furnidata", furniLimiter, furniDataRoutes)
 app.use("/api/stream", streamRoutes)
 app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
+app.use("/api/payment", paymentLimiter, paymentRoutes)
 
 // ── Rate limiting global ─────────────────────  ──────────────────────────────
 app.use(rateLimit({
@@ -66,6 +78,7 @@ app.use(rateLimit({
 // ── Rotas com rate limit global ───────────────────────────────────────────
 app.use("/api/auth", authLimiter, authRoutes)
 app.use("/api/user", userDataRoutes)
+app.use("/api/trending", trendingRoutes)
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, ts: Date.now() })
@@ -112,6 +125,7 @@ function gracefulShutdown(signal) {
 
   if (priceMonitorInterval) clearInterval(priceMonitorInterval)
   if (tokenCleanupInterval) clearInterval(tokenCleanupInterval)
+  stopTrendingMonitor()
 
   pool.end()
     .then(() => {
@@ -130,10 +144,11 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"))
 // ── Inicialização ──────────────────────────────────────────────────────────
 async function start() {
   await initDb()
-  await warmupFurniCache()
-  await connectRedis()
+  await connectRedis()        // ← PRIMEIRO: conecta Redis
+  await warmupFurniCache()    // ← DEPOIS: salva furnidata no Redis
   await initSSESubscriber()
   startPriceMonitor()
+  startTrendingMonitor()
   startTokenCleanup()
   app.listen(PORT, () => {
     console.log(`✅ Habbip API rodando na porta ${PORT}`)
