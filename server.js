@@ -12,6 +12,7 @@ import furniDataRoutes, { warmupFurniCache } from "./routes/furnidata.js"
 import streamRoutes, { initSSESubscriber } from "./routes/stream.js"
 import subscriptionRoutes from "./routes/subscriptions.js"
 import trendingRoutes from "./routes/trending.js"
+import adminRoutes from "./routes/admin.js"
 import { connectRedis } from "./services/redis.js"
 
 const app = express()
@@ -55,6 +56,7 @@ const subscriptionsLimiter = rateLimit({
 app.use("/api/furnidata", furniLimiter, furniDataRoutes)
 app.use("/api/stream", streamRoutes)
 app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
+app.use("/api/admin", adminRoutes)
 
 // ── Rate limiting global ─────────────────────  ──────────────────────────────
 app.use(rateLimit({
