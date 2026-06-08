@@ -122,6 +122,45 @@ router.delete('/users/:id/revoke', requireAdminKey, async (req, res) => {
   res.json({ ok: true, userId })
 })
 
+// PATCH /api/admin/users/:id — edita email, senha e/ou habboNick
+router.patch('/users/:id', requireAdminKey, async (req, res) => {
+  const userId = Number(req.params.id)
+  if (!userId) return res.status(400).json({ error: 'ID inválido.' })
+
+  const { email, password, habboNick } = req.body ?? {}
+  if (!email && !password && habboNick === undefined) {
+    return res.status(400).json({ error: 'Nenhum campo para atualizar.' })
+  }
+
+  const userRes = await pool.query('SELECT id FROM users WHERE id = $1', [userId])
+  if (userRes.rows.length === 0) return res.status(404).json({ error: 'Usuário não encontrado.' })
+
+  const sets = []
+  const values = []
+  let idx = 1
+
+  if (email) {
+    const emailNorm = email.trim().toLowerCase()
+    const dup = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1 AND id != $2', [emailNorm, userId])
+    if (dup.rows.length > 0) return res.status(409).json({ error: 'Email já em uso.' })
+    sets.push(`email = $${idx++}`)
+    values.push(emailNorm)
+  }
+  if (password) {
+    if (password.length < 8) return res.status(400).json({ error: 'Senha deve ter no mínimo 8 caracteres.' })
+    sets.push(`password_hash = $${idx++}`)
+    values.push(await bcrypt.hash(password, BCRYPT_ROUNDS))
+  }
+  if (habboNick !== undefined) {
+    sets.push(`habbo_nick = $${idx++}`)
+    values.push(habboNick?.trim() || null)
+  }
+
+  values.push(userId)
+  await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, values)
+  res.json({ ok: true, userId })
+})
+
 // GET /api/admin/users — lista todos os usuários com status
 router.get('/users', requireAdminKey, async (req, res) => {
   const { rows } = await pool.query(
