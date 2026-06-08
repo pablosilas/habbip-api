@@ -47,7 +47,7 @@ export async function requireSubscription(req, res, next) {
   try {
     const { rows } = await pool.query(
       `SELECT id FROM user_plan_subscriptions
-       WHERE user_id = $1 AND status = 'active' AND expires_at > NOW()
+       WHERE user_id = $1 AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())
        LIMIT 1`,
       [req.userId]
     )

@@ -15,7 +15,7 @@ function requireAdminKey(req, res, next) {
 
 // POST /api/admin/users — cria usuário
 router.post('/users', requireAdminKey, async (req, res) => {
-  const { email, password, habboNick, grantAccess = false, days = 30 } = req.body ?? {}
+  const { email, password, habboNick, grantAccess = false, days = 30, unlimited = false } = req.body ?? {}
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email e senha são obrigatórios.' })
@@ -48,9 +48,10 @@ router.post('/users', requireAdminKey, async (req, res) => {
     await client.query('INSERT INTO user_data (user_id) VALUES ($1)', [user.id])
 
     if (grantAccess) {
+      const expiresAt = unlimited ? null : `NOW() + INTERVAL '${Number(days)} days'`
       await client.query(
         `INSERT INTO user_plan_subscriptions (user_id, status, expires_at)
-         VALUES ($1, 'active', NOW() + INTERVAL '${days} days')`,
+         VALUES ($1, 'active', ${unlimited ? 'NULL' : expiresAt})`,
         [user.id]
       )
     }
@@ -72,7 +73,7 @@ router.post('/users', requireAdminKey, async (req, res) => {
 // POST /api/admin/users/:id/grant — ativa ou renova acesso
 router.post('/users/:id/grant', requireAdminKey, async (req, res) => {
   const userId = Number(req.params.id)
-  const { days = 30 } = req.body ?? {}
+  const { days = 30, unlimited = false } = req.body ?? {}
 
   if (!userId) return res.status(400).json({ error: 'ID inválido.' })
 
@@ -81,16 +82,20 @@ router.post('/users/:id/grant', requireAdminKey, async (req, res) => {
     return res.status(404).json({ error: 'Usuário não encontrado.' })
   }
 
-  const current = await pool.query(
-    `SELECT expires_at FROM user_plan_subscriptions
-     WHERE user_id = $1 AND status = 'active' AND expires_at > NOW()
-     ORDER BY expires_at DESC LIMIT 1`,
-    [userId]
-  )
-
-  const baseDate = current.rows.length > 0 ? new Date(current.rows[0].expires_at) : new Date()
-  const newExpiry = new Date(baseDate)
-  newExpiry.setDate(newExpiry.getDate() + days)
+  let newExpiry = null
+  if (!unlimited) {
+    const current = await pool.query(
+      `SELECT expires_at FROM user_plan_subscriptions
+       WHERE user_id = $1 AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY expires_at DESC NULLS LAST LIMIT 1`,
+      [userId]
+    )
+    const baseDate = (current.rows.length > 0 && current.rows[0].expires_at)
+      ? new Date(current.rows[0].expires_at)
+      : new Date()
+    newExpiry = new Date(baseDate)
+    newExpiry.setDate(newExpiry.getDate() + days)
+  }
 
   const updated = await pool.query(
     `UPDATE user_plan_subscriptions SET status = 'active', expires_at = $1, updated_at = NOW()
@@ -106,7 +111,7 @@ router.post('/users/:id/grant', requireAdminKey, async (req, res) => {
     )
   }
 
-  res.json({ ok: true, userId, email: userRes.rows[0].email, expiresAt: newExpiry })
+  res.json({ ok: true, userId, email: userRes.rows[0].email, expiresAt: newExpiry, unlimited: !newExpiry })
 })
 
 // DELETE /api/admin/users/:id/revoke — revoga acesso
@@ -165,7 +170,8 @@ router.patch('/users/:id', requireAdminKey, async (req, res) => {
 router.get('/users', requireAdminKey, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT u.id, u.email, u.habbo_nick, u.created_at,
-       s.status as subscription_status, s.expires_at
+       s.status as subscription_status, s.expires_at,
+       (s.status = 'active' AND s.expires_at IS NULL) as unlimited
      FROM users u
      LEFT JOIN LATERAL (
        SELECT status, expires_at FROM user_plan_subscriptions
