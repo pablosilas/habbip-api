@@ -11,7 +11,6 @@ import userDataRoutes from "./routes/userData.js"
 import furniDataRoutes, { warmupFurniCache } from "./routes/furnidata.js"
 import streamRoutes, { initSSESubscriber } from "./routes/stream.js"
 import subscriptionRoutes from "./routes/subscriptions.js"
-import paymentRoutes from "./routes/payment.js"
 import trendingRoutes from "./routes/trending.js"
 import { connectRedis } from "./services/redis.js"
 
@@ -52,19 +51,10 @@ const subscriptionsLimiter = rateLimit({
   message: { error: "Muitas requisições. Aguarde um momento." },
 })
 
-const paymentLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Muitas requisições de pagamento. Aguarde." },
-})
-
 // ── Rotas sem rate limit global (têm limiters próprios) ───────────────────
 app.use("/api/furnidata", furniLimiter, furniDataRoutes)
 app.use("/api/stream", streamRoutes)
 app.use("/api/subscriptions", subscriptionsLimiter, subscriptionRoutes)
-app.use("/api/payment", paymentLimiter, paymentRoutes)
 
 // ── Rate limiting global ─────────────────────  ──────────────────────────────
 app.use(rateLimit({
