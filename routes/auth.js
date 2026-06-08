@@ -216,20 +216,23 @@ router.post("/logout", requireAuth, async (req, res) => {
 
 // ── PATCH /api/auth/me ─────────────────────────────────────────────────────
 router.patch("/me", requireAuth, async (req, res) => {
-  const { currentPassword, newPassword } = req.body ?? {}
+  const { currentPassword, newPassword, email } = req.body ?? {}
 
-  if (!newPassword) {
-    return res.status(400).json({ error: "Nova senha é obrigatória." })
-  }
   if (!currentPassword) {
     return res.status(400).json({ error: "Senha atual é necessária." })
   }
-  if (!isValidPassword(newPassword)) {
+  if (!newPassword && !email) {
+    return res.status(400).json({ error: "Informe nova senha ou novo email." })
+  }
+  if (newPassword && !isValidPassword(newPassword)) {
     return res.status(400).json({ error: "Nova senha deve ter no mínimo 8 caracteres." })
+  }
+  if (email && !isValidEmail(email)) {
+    return res.status(400).json({ error: "Email inválido." })
   }
 
   const { rows } = await pool.query(
-    "SELECT password_hash FROM users WHERE id = $1",
+    "SELECT password_hash, email FROM users WHERE id = $1",
     [req.userId]
   )
   const ok = await bcrypt.compare(currentPassword, rows[0].password_hash)
@@ -237,12 +240,31 @@ router.patch("/me", requireAuth, async (req, res) => {
     return res.status(401).json({ error: "Senha atual incorreta." })
   }
 
-  await pool.query(
-    "UPDATE users SET password_hash = $1 WHERE id = $2",
-    [await bcrypt.hash(newPassword, BCRYPT_ROUNDS), req.userId]
-  )
+  const sets = []
+  const values = []
+  let idx = 1
 
-  res.json({ ok: true })
+  if (newPassword) {
+    sets.push(`password_hash = $${idx++}`)
+    values.push(await bcrypt.hash(newPassword, BCRYPT_ROUNDS))
+  }
+  if (email) {
+    const emailNorm = email.trim().toLowerCase()
+    const dup = await pool.query(
+      "SELECT id FROM users WHERE LOWER(email) = $1 AND id != $2",
+      [emailNorm, req.userId]
+    )
+    if (dup.rows.length > 0) return res.status(409).json({ error: "Email já em uso." })
+    sets.push(`email = $${idx++}`)
+    values.push(emailNorm)
+  }
+
+  values.push(req.userId)
+  await pool.query(`UPDATE users SET ${sets.join(", ")} WHERE id = $${idx}`, values)
+
+  const updated = await pool.query("SELECT id, email, habbo_nick FROM users WHERE id = $1", [req.userId])
+  const u = updated.rows[0]
+  res.json({ ok: true, user: { id: u.id, email: u.email, habboNick: u.habbo_nick } })
 })
 
 export default router
